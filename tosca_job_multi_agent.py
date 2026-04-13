@@ -79,6 +79,7 @@ import re
 import smtplib
 import ssl
 import sys
+from urllib.parse import urljoin
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -202,6 +203,15 @@ class Config:
         self.only_new_in_email = get_env_bool("ONLY_NEW_IN_EMAIL", False)
         self.days_lookback = int(os.getenv("DAYS_LOOKBACK", "21"))
         self.serpapi_key = os.getenv("SERPAPI_KEY", "").strip()
+        self.linkedin_enabled = get_env_bool("LINKEDIN_ENABLED", True)
+        self.linkedin_location = os.getenv("LINKEDIN_LOCATION", "Worldwide")
+        raw_queries = os.getenv("LINKEDIN_QUERIES", "").strip()
+        self.linkedin_queries = [q.strip() for q in raw_queries.split(";") if q.strip()] if raw_queries else [
+            "Tricentis Tosca",
+            "Tosca Automation",
+            "SAP Test Automation Tosca",
+            "QA Automation Lead Tosca",
+        ]
 
 
 def get_env_bool(name: str, default: bool) -> bool:
@@ -535,6 +545,98 @@ class SerpAPIFetcher(Fetcher):
         return jobs
 
 
+class LinkedInGuestFetcher(Fetcher):
+    """
+    Lightweight LinkedIn guest jobs fetcher.
+    Uses LinkedIn's public guest endpoint (no browser automation).
+    """
+    search_url = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
+    li_pattern = re.compile(r"<li[^>]*>.*?</li>", re.IGNORECASE | re.DOTALL)
+    url_pattern = re.compile(r'href="([^"]+)"', re.IGNORECASE | re.DOTALL)
+    title_pattern = re.compile(r'base-search-card__title[^>]*>\s*(.*?)\s*</', re.IGNORECASE | re.DOTALL)
+    company_pattern = re.compile(r'base-search-card__subtitle[^>]*>\s*(.*?)\s*</', re.IGNORECASE | re.DOTALL)
+    location_pattern = re.compile(r'job-search-card__location[^>]*>\s*(.*?)\s*</', re.IGNORECASE | re.DOTALL)
+    posted_pattern = re.compile(r"datetime=['\"]([^'\"]+)['\"]", re.IGNORECASE | re.DOTALL)
+
+    def __init__(self, queries: list[str], location: str) -> None:
+        super().__init__()
+        self.queries = queries
+        self.location = location
+
+    @staticmethod
+    def _extract_clean(pattern: re.Pattern[str], text: str, limit: int = 180) -> str | None:
+        match = pattern.search(text)
+        if not match:
+            return None
+        return clean_text(html.unescape(match.group(1)), limit=limit)
+
+    @staticmethod
+    def _extract_raw(pattern: re.Pattern[str], text: str) -> str | None:
+        match = pattern.search(text)
+        if not match:
+            return None
+        return html.unescape(match.group(1)).strip()
+
+    def _parse_cards(self, html_chunk: str) -> list[Job]:
+        jobs: list[Job] = []
+        for block in self.li_pattern.findall(html_chunk):
+            href = self._extract_raw(self.url_pattern, block) or ""
+            apply_url = normalize_url(urljoin("https://www.linkedin.com", href))
+            title = self._extract_clean(self.title_pattern, block) or ""
+            company = self._extract_clean(self.company_pattern, block) or "Unknown"
+            location = self._extract_clean(self.location_pattern, block)
+            posted_at = self._extract_raw(self.posted_pattern, block)
+
+            if not apply_url or "linkedin.com/jobs/view/" not in apply_url or not title:
+                continue
+
+            text_blob = " ".join([title, company, location or ""])
+            if not any(term in text_blob.lower() for term in ["tosca", "qa", "test", "sap", "quality"]):
+                continue
+
+            job = Job(
+                title=title,
+                company=company,
+                location=location,
+                work_model=infer_work_model(text_blob),
+                salary=None,
+                apply_url=apply_url,
+                source="LinkedIn",
+                posted_at=posted_at,
+                description=None,
+            )
+            job.age_days = parse_date_to_age_days(job.posted_at)
+            jobs.append(job)
+        return jobs
+
+    def fetch(self) -> list[Job]:
+        logger.info("Fetching LinkedIn guest jobs")
+        all_jobs: list[Job] = []
+        for query in self.queries:
+            for start in (0, 25, 50):
+                params = {
+                    "keywords": query,
+                    "location": self.location,
+                    "f_WT": "2",      # Remote
+                    "f_TPR": "r604800",  # Last 7 days
+                    "start": start,
+                }
+                try:
+                    response = self.session.get(self.search_url, params=params, timeout=HTTP_TIMEOUT)
+                    if response.status_code in {429, 999}:
+                        logger.warning("LinkedIn blocked/rate-limited request for query=%s start=%s status=%s", query, start, response.status_code)
+                        break
+                    response.raise_for_status()
+                    parsed = self._parse_cards(response.text or "")
+                    if not parsed:
+                        break
+                    all_jobs.extend(parsed)
+                except Exception:
+                    logger.exception("LinkedIn guest fetch failed for query=%s start=%s", query, start)
+                    break
+        return all_jobs
+
+
 class AgentBase:
     def __init__(self, client: OpenAI, model: str) -> None:
         self.client = client
@@ -798,6 +900,8 @@ def collect_jobs(config: Config) -> list[Job]:
         GreenhouseFetcher(),
         LeverFetcher(),
     ]
+    if config.linkedin_enabled:
+        fetchers.append(LinkedInGuestFetcher(config.linkedin_queries, config.linkedin_location))
     if config.serpapi_key:
         fetchers.append(SerpAPIFetcher(config.serpapi_key))
 
