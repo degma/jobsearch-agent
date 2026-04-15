@@ -147,6 +147,32 @@ NEGATIVE_HINTS = [
     "civil engineer",
 ]
 
+CANADA_LOCATION_HINTS = [
+    "canada",
+    "canadian",
+    "ontario",
+    "quebec",
+    "british columbia",
+    "alberta",
+    "manitoba",
+    "saskatchewan",
+    "nova scotia",
+    "new brunswick",
+    "newfoundland",
+    "prince edward island",
+    "pei",
+    "yukon",
+    "northwest territories",
+    "nunavut",
+    "toronto",
+    "vancouver",
+    "montreal",
+    "calgary",
+    "ottawa",
+    "edmonton",
+    "waterloo",
+]
+
 COMPANY_SOURCES: dict[str, list[dict[str, str]]] = {
     "greenhouse": [
         {"company": "GitLab", "board": "gitlab"},
@@ -921,6 +947,8 @@ def apply_basic_filters(jobs: list[Job], config: Config) -> list[Job]:
         haystack = " ".join(filter(None, [job.title, job.description, job.skills_summary, job.work_model, job.location])).lower()
         if not any(term in haystack for term in ["tosca", "tricentis", "qa", "test automation", "sap", "quality"]):
             continue
+        if not is_canada_based(job):
+            continue
         if config.remote_only:
             wm = (job.work_model or "").lower()
             loc = (job.location or "").lower()
@@ -933,6 +961,11 @@ def apply_basic_filters(jobs: list[Job], config: Config) -> list[Job]:
             continue
         filtered.append(job)
     return filtered
+
+
+def is_canada_based(job: Job) -> bool:
+    location_blob = " ".join(filter(None, [job.location, job.description])).lower()
+    return any(hint in location_blob for hint in CANADA_LOCATION_HINTS)
 
 
 def finalize_ranking(jobs: list[Job]) -> list[Job]:
