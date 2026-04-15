@@ -79,6 +79,8 @@ import re
 import smtplib
 import ssl
 import sys
+import time
+import argparse
 from urllib.parse import urljoin
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -238,6 +240,10 @@ class Config:
             "SAP Test Automation Tosca",
             "QA Automation Lead Tosca",
         ]
+        self.telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+        self.telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+        self.telegram_max_jobs = int(os.getenv("TELEGRAM_MAX_JOBS", "10"))
+        self.telegram_poll_seconds = int(os.getenv("TELEGRAM_POLL_SECONDS", "2"))
 
 
 def get_env_bool(name: str, default: bool) -> bool:
@@ -891,6 +897,61 @@ def send_email(subject: str, html_body: str) -> None:
     logger.info("Email sent to %s", email_to)
 
 
+def telegram_api_request(bot_token: str, method: str, payload: dict[str, Any]) -> dict[str, Any]:
+    url = f"https://api.telegram.org/bot{bot_token}/{method}"
+    response = requests.post(url, json=payload, timeout=HTTP_TIMEOUT)
+    response.raise_for_status()
+    body = response.json()
+    if not body.get("ok"):
+        raise RuntimeError(f"Telegram API error for {method}: {body}")
+    return body
+
+
+def send_telegram_message(bot_token: str, chat_id: str, text: str) -> None:
+    chunks = [text[i:i + 3500] for i in range(0, len(text), 3500)] or [text]
+    for chunk in chunks:
+        telegram_api_request(
+            bot_token,
+            "sendMessage",
+            {
+                "chat_id": chat_id,
+                "text": chunk,
+                "disable_web_page_preview": True,
+            },
+        )
+
+
+def build_telegram_digest(jobs: list[Job], max_jobs: int) -> str:
+    today = now_local().strftime("%Y-%m-%d")
+    if not jobs:
+        return (
+            f"📭 Tosca Jobs Digest ({today})\n"
+            "No matching Tricentis Tosca remote jobs were found in this run."
+        )
+
+    lines = [f"📌 Tosca Jobs Digest ({today})", f"Total matches: {len(jobs)}", ""]
+    for idx, job in enumerate(jobs[:max_jobs], start=1):
+        new_tag = "🆕 " if job.is_new else ""
+        score = job.score if job.score is not None else local_keyword_score(job)
+        location = job.location or "Location not listed"
+        posted = f"{job.age_days}d ago" if job.age_days is not None else "date n/a"
+        lines.append(
+            f"{idx}. {new_tag}{job.title} @ {job.company}\n"
+            f"   Score: {score} | {location} | {posted}\n"
+            f"   {job.apply_url}"
+        )
+    if len(jobs) > max_jobs:
+        lines.append("")
+        lines.append(f"...and {len(jobs) - max_jobs} more jobs in the filtered results.")
+    return "\n".join(lines)
+
+
+def send_telegram_digest(bot_token: str, chat_id: str, jobs: list[Job], max_jobs: int) -> None:
+    digest = build_telegram_digest(jobs, max_jobs)
+    send_telegram_message(bot_token, chat_id, digest)
+    logger.info("Telegram digest sent to chat %s", chat_id)
+
+
 def load_seen_ids() -> set[str]:
     payload = read_json(HISTORY_PATH, {"seen_ids": []})
     return set(payload.get("seen_ids", []))
@@ -983,7 +1044,7 @@ def finalize_ranking(jobs: list[Job]) -> list[Job]:
     return jobs
 
 
-def run() -> None:
+def run(send_email_enabled: bool = True, telegram_chat_id: str | None = None) -> list[Job]:
     load_dotenv(BASE_DIR / ".env")
     if not os.getenv("OPENAI_API_KEY"):
         raise RuntimeError("OPENAI_API_KEY not found in environment or .env")
@@ -1015,23 +1076,119 @@ def run() -> None:
     if config.only_new_in_email:
         email_jobs = [j for j in jobs if j.is_new]
 
-    if not email_jobs:
-        subject = f"Daily Tosca Jobs - {now_local().strftime('%Y-%m-%d')}"
-        html_body = (
-            "<html><body><p>No matching Tricentis Tosca remote jobs were found today from the configured sources.</p>"
-            "<p>You can improve coverage by adding more Greenhouse and Lever company boards or enabling SerpAPI.</p></body></html>"
-        )
-        send_email(subject, html_body)
-        save_seen_ids(updated_seen)
-        logger.info("No jobs to email")
-        return
+    if send_email_enabled:
+        if not email_jobs:
+            subject = f"Daily Tosca Jobs - {now_local().strftime('%Y-%m-%d')}"
+            html_body = (
+                "<html><body><p>No matching Tricentis Tosca remote jobs were found today from the configured sources.</p>"
+                "<p>You can improve coverage by adding more Greenhouse and Lever company boards or enabling SerpAPI.</p></body></html>"
+            )
+            send_email(subject, html_body)
+            logger.info("No jobs to email")
+        else:
+            email_agent = EmailAgent(client, config.email_model)
+            subject, html_body = email_agent.build(email_jobs, config.max_email_jobs)
+            send_email(subject, html_body)
 
-    email_agent = EmailAgent(client, config.email_model)
-    subject, html_body = email_agent.build(email_jobs, config.max_email_jobs)
-    send_email(subject, html_body)
+    if telegram_chat_id:
+        if not config.telegram_bot_token:
+            raise RuntimeError("TELEGRAM_BOT_TOKEN is required when telegram_chat_id is provided")
+        send_telegram_digest(config.telegram_bot_token, telegram_chat_id, jobs, config.telegram_max_jobs)
+
     save_seen_ids(updated_seen)
-    logger.info("Done. %s matching jobs, %s emailed.", len(jobs), len(email_jobs[:config.max_email_jobs]))
+    logger.info("Done. %s matching jobs, %s email candidates.", len(jobs), len(email_jobs[:config.max_email_jobs]))
+    return jobs
+
+
+def poll_telegram_updates(bot_token: str, offset: int | None = None, timeout_seconds: int = 45) -> list[dict[str, Any]]:
+    params: dict[str, Any] = {"timeout": timeout_seconds}
+    if offset is not None:
+        params["offset"] = offset
+    url = f"https://api.telegram.org/bot{bot_token}/getUpdates"
+    response = requests.get(url, params=params, timeout=timeout_seconds + 10)
+    response.raise_for_status()
+    payload = response.json()
+    if not payload.get("ok"):
+        raise RuntimeError(f"Telegram polling failed: {payload}")
+    return payload.get("result", [])
+
+
+def run_telegram_bot() -> None:
+    load_dotenv(BASE_DIR / ".env")
+    config = Config()
+    if not config.telegram_bot_token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is required for --telegram-bot mode")
+
+    logger.info("Telegram bot polling started. Use /run to trigger job search.")
+    offset: int | None = None
+
+    while True:
+        updates = poll_telegram_updates(config.telegram_bot_token, offset=offset, timeout_seconds=45)
+        for update in updates:
+            offset = int(update.get("update_id", 0)) + 1
+            message = update.get("message") or {}
+            chat = message.get("chat") or {}
+            text = (message.get("text") or "").strip()
+            chat_id = str(chat.get("id") or "").strip()
+            if not text or not chat_id:
+                continue
+
+            if config.telegram_chat_id and chat_id != config.telegram_chat_id:
+                logger.info("Ignoring Telegram command from unauthorized chat %s", chat_id)
+                continue
+
+            if text.lower() in {"/start", "/help"}:
+                help_text = (
+                    "🤖 Tosca Job Agent Bot\n"
+                    "Available commands:\n"
+                    "/run - fetch jobs now and send digest here\n"
+                    "/help - show this help message"
+                )
+                send_telegram_message(config.telegram_bot_token, chat_id, help_text)
+                continue
+
+            if text.lower() == "/run":
+                send_telegram_message(config.telegram_bot_token, chat_id, "⏳ Running job search, please wait...")
+                try:
+                    run(send_email_enabled=False, telegram_chat_id=chat_id)
+                except Exception as exc:
+                    logger.exception("Telegram-triggered run failed")
+                    send_telegram_message(config.telegram_bot_token, chat_id, f"❌ Run failed: {exc}")
+                continue
+
+            send_telegram_message(
+                config.telegram_bot_token,
+                chat_id,
+                "Unknown command. Send /run to fetch jobs or /help for instructions.",
+            )
+        time.sleep(max(config.telegram_poll_seconds, 1))
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Tosca job finder automation runner")
+    parser.add_argument(
+        "--telegram-bot",
+        action="store_true",
+        help="Run a Telegram bot polling loop. Use /run in Telegram to trigger job collection and digest delivery.",
+    )
+    parser.add_argument(
+        "--telegram-chat-id",
+        type=str,
+        default="",
+        help="Send a Telegram digest for this run to a specific chat ID.",
+    )
+    parser.add_argument(
+        "--no-email",
+        action="store_true",
+        help="Skip email sending for this run.",
+    )
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    run()
+    args = parse_args()
+    if args.telegram_bot:
+        run_telegram_bot()
+    else:
+        target_chat = args.telegram_chat_id.strip() if args.telegram_chat_id else None
+        run(send_email_enabled=not args.no_email, telegram_chat_id=target_chat)
